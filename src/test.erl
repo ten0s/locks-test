@@ -3,7 +3,7 @@
 %-compile(export_all).
 
 %% $ rebar3 compile
-%% $ erl -noshell -pa _build/default/lib/*/ebin/ -eval 'test:run().'
+%% $ erl -noshell -hidden -pa _build/default/lib/*/ebin/ -eval 'test:run().'
 
 -define(MASTER, 'master@127.0.0.1').
 -define(MAX_NAMES, 10).
@@ -26,29 +26,25 @@ loop(Hosts, Names, Nodes) ->
         [ping_nodes || length(Nodes) > 1]
     )) of
     join ->
-        io:format("*** JOIN ***~n", []),
         Host = oneof(Hosts),
         Name = oneof(Names),
         Node = join(Host, Name, Nodes),
         loop(Hosts, lists:delete(Name, Names), [Node | Nodes]);
     leave ->
-        io:format("*** LEAVE ***~n", []),
         Node = oneof(Nodes),
         leave(Node),
         loop(Hosts, [node_name(Node) | Names], lists:delete(Node, Nodes));
     count_leaders ->
-        io:format("*** COUNT LEADERS ***~n", []),
         case count_leaders(Nodes) of
         ok ->
             loop(Hosts, Names, Nodes);
         error ->
-            io:format("*** LEAVE ALL NODES ***~n", []),
+            io:format("*** LEAVE ALL ***~n", []),
             [leave(Node) || Node <- Nodes],
             Names2 = [node_name(Node) || Node <- Nodes] ++ Names,
             loop(Hosts, Names2, [])
         end;
     ping_nodes ->
-        io:format("*** PING NODES ***~n", []),
         Node = oneof(Nodes),
         ping_nodes(Node, Nodes -- [Node]),
         loop(Hosts, Names, Nodes)
@@ -65,6 +61,7 @@ start_master() ->
     end.
 
 join(Host, Name, Nodes) ->
+    io:format("*** JOIN '~s@~s' ***~n", [Name, Host]),
     Node = start_slave(Host, Name, ?START_ARGS),
     start_worker(Node),
     %%
@@ -75,10 +72,12 @@ join(Host, Name, Nodes) ->
     Node.
 
 leave(Node) ->
+    io:format("*** LEAVE ~p ***~n", [Node]),
     stop_worker(Node),
     stop_slave(Node).
 
 count_leaders(Nodes) ->
+    io:format("*** COUNT LEADERS ***~n", []),
     L = [{Node, is_leader(Node)} || Node <- Nodes],
     case catch lists:sum([count_leader(Res) || {_Node, Res} <- L]) of
     0 ->
@@ -92,6 +91,9 @@ count_leaders(Nodes) ->
         ok;
     _ ->
         io:format("~nCheck nodes: ~p~n", [L]),
+        {ok, DotFile, PngFile} = build_nodes_graph(L),
+        io:format("~nCheck graph: ~s ~s~n", [DotFile, PngFile]),
+        io:format("~p~n", [calendar:local_time()]),
         io:fread("\nPress Enter to continue", ""),
         error
     end.
@@ -138,7 +140,66 @@ is_leader(Node) ->
     rpc(Node, is_leader).
 
 ping_nodes(Node, Nodes) ->
+    io:format("*** PING NODES ***~n", []),
     rpc(Node, {ping_nodes, Nodes}).
+
+-record(info, {
+    node,
+    is_leader,
+    known_nodes
+}).
+
+build_nodes_graph(Nodes) ->
+    Infos = lists:foldl(fun ({Node, IsLeader}, Acc) ->
+        Info = #info{
+            node = Node,
+            is_leader = IsLeader,
+            known_nodes = known_nodes(Node)
+        },
+        [Info | Acc]
+    end, [], Nodes),
+    %% `strict` mode to remove duplicate edges
+    Header = "strict graph {\n",
+    Footer = "}\n",
+    Defines = [dot_node(I) || I <- Infos],
+    Connections = lists:foldl(fun (#info{node = Node, known_nodes = KNodes}, Acc1) ->
+        lists:foldl(fun (KNode, Acc2) -> [node_name(Node), " -- ", node_name(KNode), "\n" | Acc2] end, Acc1, KNodes)
+    end, [], Infos),
+    Dot = [Header, Defines, Connections, Footer],
+    {{Y,Mon,D},{H,M,S}} = calendar:local_time(),
+    Ts = io_lib:format("~4..0B-~2..0B-~2..0BT~2..0B-~2..0B-~2..0B", [Y, Mon, D, H, M, S]),
+    DotFile = ["cluster-", Ts, ".dot"],
+    PngFile = ["cluster-", Ts, ".png"],
+    ok = file:write_file(DotFile, Dot),
+    os:cmd(["dot", " -T png ", " -o ", PngFile, " ", DotFile]),
+    os:cmd(["xviewer", " ", PngFile]),
+    {ok, DotFile, PngFile}.
+
+dot_node(Info) ->
+    [node_name(Info#info.node), " ", dot_props([dot_prop_label(Info), dot_prop_color(Info)])].
+
+dot_props(Props) ->
+    ["[",
+        [[P, " "] || P <- Props],
+     "]\n"].
+
+dot_prop_label(#info{node = Node, known_nodes = KNodes}) ->
+    dot_prop("label", [node_name(Node), "^", integer_to_list(length(KNodes))]).
+
+dot_prop_color(#info{is_leader = IsLeader}) ->
+    Color =
+        case IsLeader of
+        true  -> "blue";
+        false -> "black";
+        _     -> "red"
+        end,
+    dot_prop("color", Color).
+
+dot_prop(Name, Value) ->
+    [Name, "=", "\"", Value, "\""].
+
+known_nodes(Node) ->
+    rpc(Node, known_nodes).
 
 rpc(Node, Req) ->
     Ref = make_ref(),
@@ -178,6 +239,9 @@ worker(Parent) ->
                 Loop(Pid);
             {Ref, From, is_leader} ->
                 From ! {Ref, catch asg_manager:is_leader()},
+                Loop(LeaderPid);
+            {Ref, From, known_nodes} ->
+                From ! {Ref, erlang:nodes()},
                 Loop(LeaderPid);
             {'EXIT', LeaderPid, restart} ->
                 io:format("~p: leader restart~n", [node()]),
