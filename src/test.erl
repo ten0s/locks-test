@@ -163,7 +163,9 @@ build_nodes_graph(Nodes) ->
     Footer = "}\n",
     Defines = [dot_node(I) || I <- Infos],
     Connections = lists:foldl(fun (#info{node = Node, known_nodes = KNodes}, Acc1) ->
-        lists:foldl(fun (KNode, Acc2) -> [node_name(Node), " -- ", node_name(KNode), "\n" | Acc2] end, Acc1, KNodes)
+            lists:foldl(fun (KNode, Acc2) ->
+                [node_name(Node), " -- ", node_name(KNode), "\n" | Acc2]
+            end, Acc1, KNodes)
     end, [], Infos),
     Dot = [Header, Defines, Connections, Footer],
     {{Y,Mon,D},{H,M,S}} = calendar:local_time(),
