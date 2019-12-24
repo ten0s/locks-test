@@ -34,10 +34,10 @@ Run test:continue(). to proceed
 ```
 $ erl -hidden -name adm$$@127.0.0.1 -remsh master@127.0.0.1
 
-> test:graph().
-> test:restart('slave1@127.0.0.1').
-> test:graph().
-> test:continue().
+> test:graph(). % draw nodes graph
+> test:restart('slave6@127.0.0.1'). % restart hanged (red) node
+> test:graph(). % draw nodes graph
+> test:continue(). % proceed
 ```
 
 #### Run and auto-heal
@@ -54,7 +54,7 @@ $ make run-heal
 ```
 $ erl -hidden -name adm$$@127.0.0.1 -remsh master@127.0.0.1
 
-> test:pause().
-> test:graph().
-> test:continue().
+> test:pause(). % pause to investigate
+> test:graph(). % draw nodes graph
+> test:continue(). % proceed
 ```
