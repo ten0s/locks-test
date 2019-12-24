@@ -21,6 +21,7 @@ Check nodes: [{'slave3@127.0.0.1',false},
               {'slave10@127.0.0.1',true}]
 Connect to master@127.0.0.1 and run:
 test:graph().
+test:stats().
 test:restart(Node).
 test:join(Node).
 test:leave(Node).
@@ -56,5 +57,7 @@ $ erl -hidden -name adm$$@127.0.0.1 -remsh master@127.0.0.1
 
 > test:pause(). % pause to investigate
 > test:graph(). % draw nodes graph
+> test:stats(). % test statistics
+[{uptime,196},{fails,3}]
 > test:continue(). % proceed
 ```

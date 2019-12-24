@@ -11,7 +11,8 @@
     graph/0,
     join/1,
     leave/1,
-    restart/1
+    restart/1,
+    stats/0
 ]).
 %-compile(export_all).
 
@@ -22,6 +23,12 @@
 -define(MAX_NAMES, 10).
 -define(START_ARGS, "-pa _build/default/lib/*/ebin _checkouts/*/ebin/ -connect_all false").
 
+-record(st, {
+    on_fail :: investigate | heal,
+    start = calendar:local_time(),
+    fails  = 0
+}).
+
 run() ->
     run(investigate).
 
@@ -30,7 +37,7 @@ run(OnFail) when OnFail =:= investigate; OnFail =:= heal ->
     Names = slave_names(?MAX_NAMES),
     ok = start_master(),
     register(master_loop, spawn(fun () ->
-        loop(OnFail, Hosts, Names, [])
+        loop(Hosts, Names, [], #st{on_fail = OnFail})
     end)).
 
 stop() ->
@@ -54,45 +61,63 @@ continue() ->
 restart(Node) ->
     master_loop ! {restart, Node}.
 
-investigate(OnFail, Hosts, Names, Nodes) ->
+stats() ->
+    rpc_master(stats).
+
+stats(#st{start = Start, fails = Fails}) ->
+    Now = calendar:local_time(),
+    Uptime = calendar:datetime_to_gregorian_seconds(Now) -
+             calendar:datetime_to_gregorian_seconds(Start),
+    [{uptime, Uptime}, {fails, Fails}].
+
+inc_fails(St = #st{}, Fails) ->
+    St#st{fails = St#st.fails + Fails}.
+
+investigate(Hosts, Names, Nodes, St) ->
     receive
         graph ->
             L = [{Node, is_leader(Node)} || Node <- Nodes],
             {ok, DotFile, PngFile} = build_nodes_graph(L),
             io:format("~nCheck graph: ~s ~s~n", [DotFile, PngFile]),
-            investigate(OnFail, Hosts, Names, Nodes);
+            investigate(Hosts, Names, Nodes, St);
         {restart, Node} ->
             stop_leader(Node),
             start_leader(Node, Nodes -- [Node]),
-            investigate(OnFail, Hosts, Names, Nodes);
+            investigate(Hosts, Names, Nodes, St);
         {join, Node} ->
             Name = node_name(Node),
             Host = node_host(Node),
             Node = join(Host, Name, Nodes),
-            investigate(OnFail, Hosts, lists:delete(Name, Names), [Node | Nodes]);
+            investigate(Hosts, lists:delete(Name, Names), [Node | Nodes], St);
         {leave, Node} ->
             leave_(Node),
-            loop(OnFail, Hosts, [node_name(Node) | Names], lists:delete(Node, Nodes));
+            investigate(Hosts, [node_name(Node) | Names], lists:delete(Node, Nodes), St);
+        {Ref, From, stats} ->
+            From ! {Ref, stats(St)},
+            investigate(Hosts, Names, Nodes, St);
         continue ->
-            loop(OnFail, Hosts, Names, Nodes);
+            loop(Hosts, Names, Nodes, St);
         Msg ->
             io:format("### Unknown: ~p~n", [Msg]),
-            investigate(OnFail, Hosts, Names, Nodes)
+            investigate(Hosts, Names, Nodes, St)
     end.
 
-%% OnFailAction, AvailableHosts, AvailableNames, RunningNodes
-loop(OnFail, Hosts, Names, Nodes) ->
+%% AvailableHosts, AvailableNames, RunningNodes, State
+loop(Hosts, Names, Nodes, St) ->
     receive
         graph ->
             L = [{Node, is_leader(Node)} || Node <- Nodes],
             {ok, DotFile, PngFile} = build_nodes_graph(L),
             io:format("~nCheck graph: ~s ~s~n", [DotFile, PngFile]),
-            loop(OnFail, Hosts, Names, Nodes);
+            loop(Hosts, Names, Nodes, St);
+        {Ref, From, stats} ->
+            From ! {Ref, stats(St)},
+            loop(Hosts, Names, Nodes, St);
         pause ->
-            investigate(OnFail, Hosts, Names, Nodes);
+            investigate(Hosts, Names, Nodes, St);
         Msg ->
             io:format("### Unknown: ~p~n", [Msg]),
-            loop(OnFail, Hosts, Names, Nodes)
+            loop(Hosts, Names, Nodes, St)
     after 0 ->
         case oneof(lists:flatten(
             [join || Names =/= []] ++
@@ -104,57 +129,63 @@ loop(OnFail, Hosts, Names, Nodes) ->
             Host = oneof(Hosts),
             Name = oneof(Names),
             Node = join(Host, Name, Nodes),
-            loop(OnFail, Hosts, lists:delete(Name, Names), [Node | Nodes]);
+            loop(Hosts, lists:delete(Name, Names), [Node | Nodes], St);
         leave ->
             Node = oneof(Nodes),
             leave_(Node),
-            loop(OnFail, Hosts, [node_name(Node) | Names], lists:delete(Node, Nodes));
+            loop(Hosts, [node_name(Node) | Names], lists:delete(Node, Nodes), St);
         check_cluster ->
             io:format("*** CHECK CLUSTER ***~n", []),
             L = [{Node, is_leader(Node)} || Node <- Nodes],
             case check_cluster(L) of
             {[Leader], []} ->
                 io:format("*** SINGLE LEADER: ~p, CONSENSUS ***~n", [Leader]),
-                loop(OnFail, Hosts, Names, Nodes);
+                loop(Hosts, Names, Nodes, St);
             {Leaders, []} ->
                 io:format("*** MULTIPLE LEADERS: ~p ***~n", [Leaders]),
-                loop(OnFail, Hosts, Names, Nodes);
+                loop(Hosts, Names, Nodes, St);
             {Leaders, FailedNodes} ->
                 io:format("~nCheck nodes: ~p~n", [L]),
-                case OnFail of
+                case St#st.on_fail of
                 investigate ->
                     io:format("Connect to master@127.0.0.1 and run:~n"),
                     io:format("test:graph().~n"),
+                    io:format("test:stats().~n"),
                     io:format("test:restart(Node).~n"),
                     io:format("test:join(Node).~n"),
                     io:format("test:leave(Node).~n"),
                     io:format("test:ping_nodes(Node, Nodes).~n"),
                     io:format("test:is_leader(Node).~n"),
                     io:format("Run test:continue(). to proceed~n"),
-                    investigate(OnFail, Hosts, Names, Nodes);
+                    investigate(Hosts, Names, Nodes,
+                        inc_fails(St, length(FailedNodes)));
                 heal ->
-                    heal_cluster(OnFail, Hosts, Names, Nodes, Leaders, FailedNodes)
+                    heal_cluster(Hosts, Names, Nodes, Leaders, FailedNodes,
+                        inc_fails(St, length(FailedNodes)))
                 end
             end;
         ping_nodes ->
             Node = oneof(Nodes),
             ping_nodes(Node, Nodes -- [Node]),
-            loop(OnFail, Hosts, Names, Nodes)
+            loop(Hosts, Names, Nodes, St)
         end
     end.
 
-heal_cluster(OnFail, Hosts, Names, Nodes, Leaders, FailedNodes) ->
+heal_cluster(Hosts, Names, Nodes, Leaders, FailedNodes, St) ->
     receive
         graph ->
             L = [{Node, is_leader(Node)} || Node <- Nodes],
             {ok, DotFile, PngFile} = build_nodes_graph(L),
             io:format("~nCheck graph: ~s ~s~n", [DotFile, PngFile]),
-            heal_cluster(OnFail, Hosts, Names, Nodes, Leaders, FailedNodes);
+            heal_cluster(Hosts, Names, Nodes, Leaders, FailedNodes, St);
+        {Ref, From, stats} ->
+            From ! {Ref, stats(St)},
+            heal_cluster(Hosts, Names, Nodes, Leaders, FailedNodes, St);
         pause ->
-            heal_cluster(OnFail, Hosts, Names, Nodes, Leaders, FailedNodes);
+            heal_cluster(Hosts, Names, Nodes, Leaders, FailedNodes, St);
         Msg ->
             io:format("### Unknown: ~p~n", [Msg]),
-            heal_cluster(OnFail, Hosts, Names, Nodes, Leaders, FailedNodes)
+            heal_cluster(Hosts, Names, Nodes, Leaders, FailedNodes, St)
     after 0 ->
         io:format("*** HEAL CLUSTER ***~n", []),
         restart_leaders(FailedNodes, Nodes),
@@ -165,23 +196,26 @@ heal_cluster(OnFail, Hosts, Names, Nodes, Leaders, FailedNodes) ->
         case check_cluster(L) of
         {[Leader2], []} ->
             io:format("*** SINGLE LEADER: ~p, CONSENSUS ***~n", [Leader2]),
-            loop(OnFail, Hosts, Names, Nodes);
+            loop(Hosts, Names, Nodes, St);
         {Leaders2, []} ->
             io:format("*** MULTIPLE LEADERS: ~p ***~n", [Leaders2]),
-            loop(OnFail, Hosts, Names, Nodes);
+            loop(Hosts, Names, Nodes, St);
 
         {[], FailedNodes2} ->
             io:format("*** NO LEADER, FAILED: ~p ***~n", [FailedNodes2]),
             io:format("~nCheck nodes: ~p~n", [L]),
-            heal_cluster(OnFail, Hosts, Names, Nodes, Leaders, FailedNodes2);
+            heal_cluster(Hosts, Names, Nodes, Leaders, FailedNodes2,
+                inc_fails(St, length(FailedNodes2)));
         {[Leader2], FailedNodes2} ->
             io:format("*** SINGLE LEADER: ~p, FAILED: ~p ***~n", [Leader2, FailedNodes2]),
             io:format("~nCheck nodes: ~p~n", [L]),
-            heal_cluster(OnFail, Hosts, Names, Nodes, [Leader2], FailedNodes2);
+            heal_cluster(Hosts, Names, Nodes, [Leader2], FailedNodes2,
+                inc_fails(St, length(FailedNodes2)));
         {Leaders2, FailedNodes2} ->
             io:format("*** MULTIPLE LEADERS: ~p, FAILED: ~p ***~n", [Leaders2, FailedNodes2]),
             io:format("~nCheck nodes: ~p~n", [L]),
-            heal_cluster(OnFail, Hosts, Names, Nodes, Leaders2, FailedNodes2)
+            heal_cluster(Hosts, Names, Nodes, Leaders2, FailedNodes2,
+                inc_fails(St, length(FailedNodes2)))
         end
     end.
 
@@ -261,23 +295,23 @@ start_worker(Node) ->
     end.
 
 stop_worker(Node) ->
-    rpc(Node, stop).
+    rpc_worker(Node, stop).
 
 ping(Node) ->
-    rpc(Node, ping).
+    rpc_worker(Node, ping).
 
 start_leader(Node, Nodes) ->
-    rpc(Node, {start_leader, Nodes}).
+    rpc_worker(Node, {start_leader, Nodes}).
 
 stop_leader(Node) ->
-    rpc(Node, stop_leader).
+    rpc_worker(Node, stop_leader).
 
 is_leader(Node) ->
-    rpc(Node, is_leader).
+    rpc_worker(Node, is_leader).
 
 ping_nodes(Node, Nodes) ->
     io:format("*** PING NODES ***~n", []),
-    rpc(Node, {ping_nodes, Nodes}).
+    rpc_worker(Node, {ping_nodes, Nodes}).
 
 -record(info, {
     node,
@@ -342,12 +376,18 @@ dot_prop(Name, Value) ->
     [Name, "=", "\"", Value, "\""].
 
 known_nodes(Node) ->
-    rpc(Node, known_nodes).
+    rpc_worker(Node, known_nodes).
 
-rpc(Node, Req) ->
+rpc_master(Req) ->
+    rpc(master_loop, Req).
+
+rpc_worker(Node, Req) ->
+    rpc({worker, Node}, Req).
+
+rpc(Who, Req) ->
     Ref = make_ref(),
     Self = self(),
-    {worker, Node} ! {Ref, Self, Req},
+    Who ! {Ref, Self, Req},
     receive
     {Ref, Rep} ->
         Rep
