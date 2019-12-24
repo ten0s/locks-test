@@ -1,4 +1,5 @@
 _build/
+_checkouts/
 erl_crash.dump
 *.dot
 *.png

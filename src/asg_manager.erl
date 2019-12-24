@@ -7,7 +7,8 @@
     start_link/0,
     start_link/1,
     stop/0,
-    is_leader/0
+    is_leader/0,
+    info/0, info/1
 ]).
 -ignore_xref([start_link/0]).
 
@@ -32,14 +33,16 @@ start_link(Nodes) when is_list(Nodes) ->
     locks_leader:start_link(?MODULE, ?MODULE, L, []).
 
 stop() ->
-    locks_leader:call(asg_manager, stop).
+    locks_leader:call(?MODULE, stop).
 
 is_leader() ->
-    locks_leader:call(asg_manager, is_leader).
+    locks_leader:call(?MODULE, is_leader).
 
-%% cluster_nodes() ->
-%%     [list_to_atom(lists:concat(["n", "@", Host])) ||
-%%         Host <- string:tokens(os:cmd("./asg-hosts.sh"), "\n")].
+info() ->
+    locks_leader:info(?MODULE).
+
+info(Item) ->
+    locks_leader:info(?MODULE, Item).
 
 %%%------------------------------------------------------------------------
 %%% Callback functions from gen_server
@@ -79,7 +82,8 @@ init(Nodes) ->
 %%                              {reply, Synch, State} | {ok, Synch, State}
 %% @end
 %%-------------------------------------------------------------------------
-elected(State = #state{is_leader = true}, _Election, undefined) ->
+elected(State = #state{is_leader = true}, Election, undefined) ->
+    io:format("~p: elected already, cands: ~p~n", [node(), cands(Election)]),
     {ok, {elected, node()}, State};
 elected(State, Election, undefined) ->
     io:format("~p: elected, cands: ~p~n", [node(), cands(Election)]),
@@ -198,7 +202,11 @@ handle_call(stop, _From, State = #state{is_leader = Flag}, Election) ->
     {stop, normal, ok, State};
 
 handle_call(is_leader, _From, State = #state{is_leader = Flag}, _Election) ->
-    {reply, Flag, State}.
+    {reply, Flag, State};
+
+handle_call(Req, _From, State, Election) ->
+    io:format("~p: unknown call: ~p, cands: ~p~n", [node(), Req, cands(Election)]),
+    {reply, {error, unknown_request}, State}.
 
 %%-------------------------------------------------------------------------
 %% @private
@@ -210,7 +218,8 @@ handle_call(is_leader, _From, State = #state{is_leader = Flag}, _Election) ->
 %%                                  {stop, Reason, State}
 %% @end
 %%-------------------------------------------------------------------------
-handle_cast(_Msg, State, _Election) ->
+handle_cast(Msg, State, Election) ->
+    io:format("~p: unknown cast: ~p, cands: ~p~n", [node(), Msg, cands(Election)]),
     {ok, State}.
 
 %%-------------------------------------------------------------------------
@@ -237,7 +246,8 @@ handle_info(refresh_nodes, State, Election) ->
         {ok, State}
     end;
 
-handle_info(_Info, State, _Election) ->
+handle_info(Info, State, Election) ->
+    io:format("~p: unknown info: ~p, cands: ~p~n", [node(), Info, cands(Election)]),
     {ok, State}.
 
 %%-------------------------------------------------------------------------

@@ -1,54 +1,206 @@
 -module(test).
--export([run/0, stop/0]).
+-export([run/0, run/1, stop/0]).
+-export([
+    ping/1,
+    start_leader/2,
+    stop_leader/1,
+    is_leader/1,
+    ping_nodes/2,
+    pause/0,
+    continue/0,
+    graph/0,
+    join/1,
+    leave/1,
+    restart/1
+]).
 %-compile(export_all).
 
 %% $ rebar3 compile
-%% $ erl -noshell -hidden -pa _build/default/lib/*/ebin/ -eval 'test:run().'
+%% $ erl -noshell -hidden -pa _build/default/lib/*/ebin/ _checkouts/*/ebin/ -eval 'test:run(investigate).'
 
 -define(MASTER, 'master@127.0.0.1').
 -define(MAX_NAMES, 10).
--define(START_ARGS, "-pa _build/default/lib/*/ebin -connect_all false").
+-define(START_ARGS, "-pa _build/default/lib/*/ebin _checkouts/*/ebin/ -connect_all false").
 
 run() ->
+    run(investigate).
+
+run(OnFail) when OnFail =:= investigate; OnFail =:= heal ->
     Hosts = ["127.0.0.1"],
     Names = slave_names(?MAX_NAMES),
     ok = start_master(),
-    {ok, _Nodes} = loop(Hosts, Names, []).
+    register(master_loop, spawn(fun () ->
+        loop(OnFail, Hosts, Names, [])
+    end)).
 
 stop() ->
-    [leave(Node) || Node <- nodes()].
+    [leave_(Node) || Node <- nodes()].
 
-loop(Hosts, Names, Nodes) ->
-    case oneof(lists:flatten(
-        [join || Names =/= []] ++
-        [leave || Nodes =/= []] ++
-        [count_leaders || Nodes =/= []] ++
-        [ping_nodes || length(Nodes) > 1]
-    )) of
-    join ->
-        Host = oneof(Hosts),
-        Name = oneof(Names),
-        Node = join(Host, Name, Nodes),
-        loop(Hosts, lists:delete(Name, Names), [Node | Nodes]);
-    leave ->
-        Node = oneof(Nodes),
-        leave(Node),
-        loop(Hosts, [node_name(Node) | Names], lists:delete(Node, Nodes));
-    count_leaders ->
-        case count_leaders(Nodes) of
-        ok ->
-            loop(Hosts, Names, Nodes);
-        error ->
-            io:format("*** LEAVE ALL ***~n", []),
-            [leave(Node) || Node <- Nodes],
-            Names2 = [node_name(Node) || Node <- Nodes] ++ Names,
-            loop(Hosts, Names2, [])
-        end;
-    ping_nodes ->
-        Node = oneof(Nodes),
-        ping_nodes(Node, Nodes -- [Node]),
-        loop(Hosts, Names, Nodes)
+graph() ->
+    master_loop ! graph.
+
+join(Node) ->
+    master_loop ! {join, Node}.
+
+leave(Node) ->
+    master_loop ! {leave, Node}.
+
+pause() ->
+    master_loop ! pause.
+
+continue() ->
+    master_loop ! continue.
+
+restart(Node) ->
+    master_loop ! {restart, Node}.
+
+investigate(OnFail, Hosts, Names, Nodes) ->
+    receive
+        graph ->
+            L = [{Node, is_leader(Node)} || Node <- Nodes],
+            {ok, DotFile, PngFile} = build_nodes_graph(L),
+            io:format("~nCheck graph: ~s ~s~n", [DotFile, PngFile]),
+            investigate(OnFail, Hosts, Names, Nodes);
+        {restart, Node} ->
+            stop_leader(Node),
+            start_leader(Node, Nodes -- [Node]),
+            investigate(OnFail, Hosts, Names, Nodes);
+        {join, Node} ->
+            Name = node_name(Node),
+            Host = node_host(Node),
+            Node = join(Host, Name, Nodes),
+            investigate(OnFail, Hosts, lists:delete(Name, Names), [Node | Nodes]);
+        {leave, Node} ->
+            leave_(Node),
+            loop(OnFail, Hosts, [node_name(Node) | Names], lists:delete(Node, Nodes));
+        continue ->
+            loop(OnFail, Hosts, Names, Nodes);
+        Msg ->
+            io:format("### Unknown: ~p~n", [Msg]),
+            investigate(OnFail, Hosts, Names, Nodes)
     end.
+
+%% OnFailAction, AvailableHosts, AvailableNames, RunningNodes
+loop(OnFail, Hosts, Names, Nodes) ->
+    receive
+        graph ->
+            L = [{Node, is_leader(Node)} || Node <- Nodes],
+            {ok, DotFile, PngFile} = build_nodes_graph(L),
+            io:format("~nCheck graph: ~s ~s~n", [DotFile, PngFile]),
+            loop(OnFail, Hosts, Names, Nodes);
+        pause ->
+            investigate(OnFail, Hosts, Names, Nodes);
+        Msg ->
+            io:format("### Unknown: ~p~n", [Msg]),
+            loop(OnFail, Hosts, Names, Nodes)
+    after 0 ->
+        case oneof(lists:flatten(
+            [join || Names =/= []] ++
+            [leave || Nodes =/= []] ++
+            [check_cluster || Nodes =/= []] ++
+            [ping_nodes || length(Nodes) > 1]
+        )) of
+        join ->
+            Host = oneof(Hosts),
+            Name = oneof(Names),
+            Node = join(Host, Name, Nodes),
+            loop(OnFail, Hosts, lists:delete(Name, Names), [Node | Nodes]);
+        leave ->
+            Node = oneof(Nodes),
+            leave_(Node),
+            loop(OnFail, Hosts, [node_name(Node) | Names], lists:delete(Node, Nodes));
+        check_cluster ->
+            io:format("*** CHECK CLUSTER ***~n", []),
+            L = [{Node, is_leader(Node)} || Node <- Nodes],
+            case check_cluster(L) of
+            {[Leader], []} ->
+                io:format("*** SINGLE LEADER: ~p, CONSENSUS ***~n", [Leader]),
+                loop(OnFail, Hosts, Names, Nodes);
+            {Leaders, []} ->
+                io:format("*** MULTIPLE LEADERS: ~p ***~n", [Leaders]),
+                loop(OnFail, Hosts, Names, Nodes);
+            {Leaders, FailedNodes} ->
+                io:format("~nCheck nodes: ~p~n", [L]),
+                case OnFail of
+                investigate ->
+                    io:format("Connect to master@127.0.0.1 and run:~n"),
+                    io:format("test:graph().~n"),
+                    io:format("test:restart(Node).~n"),
+                    io:format("test:join(Node).~n"),
+                    io:format("test:leave(Node).~n"),
+                    io:format("test:ping_nodes(Node, Nodes).~n"),
+                    io:format("test:is_leader(Node).~n"),
+                    io:format("Run test:continue(). to proceed~n"),
+                    investigate(OnFail, Hosts, Names, Nodes);
+                heal ->
+                    heal_cluster(OnFail, Hosts, Names, Nodes, Leaders, FailedNodes)
+                end
+            end;
+        ping_nodes ->
+            Node = oneof(Nodes),
+            ping_nodes(Node, Nodes -- [Node]),
+            loop(OnFail, Hosts, Names, Nodes)
+        end
+    end.
+
+heal_cluster(OnFail, Hosts, Names, Nodes, Leaders, FailedNodes) ->
+    receive
+        graph ->
+            L = [{Node, is_leader(Node)} || Node <- Nodes],
+            {ok, DotFile, PngFile} = build_nodes_graph(L),
+            io:format("~nCheck graph: ~s ~s~n", [DotFile, PngFile]),
+            heal_cluster(OnFail, Hosts, Names, Nodes, Leaders, FailedNodes);
+        pause ->
+            heal_cluster(OnFail, Hosts, Names, Nodes, Leaders, FailedNodes);
+        Msg ->
+            io:format("### Unknown: ~p~n", [Msg]),
+            heal_cluster(OnFail, Hosts, Names, Nodes, Leaders, FailedNodes)
+    after 0 ->
+        io:format("*** HEAL CLUSTER ***~n", []),
+        restart_leaders(FailedNodes, Nodes),
+        %% No need to connect the leaders since pings will do it shortly
+        %connect_leaders(Leaders, Nodes),
+
+        L = [{Node, is_leader(Node)} || Node <- Nodes],
+        case check_cluster(L) of
+        {[Leader2], []} ->
+            io:format("*** SINGLE LEADER: ~p, CONSENSUS ***~n", [Leader2]),
+            loop(OnFail, Hosts, Names, Nodes);
+        {Leaders2, []} ->
+            io:format("*** MULTIPLE LEADERS: ~p ***~n", [Leaders2]),
+            loop(OnFail, Hosts, Names, Nodes);
+
+        {[], FailedNodes2} ->
+            io:format("*** NO LEADER, FAILED: ~p ***~n", [FailedNodes2]),
+            io:format("~nCheck nodes: ~p~n", [L]),
+            heal_cluster(OnFail, Hosts, Names, Nodes, Leaders, FailedNodes2);
+        {[Leader2], FailedNodes2} ->
+            io:format("*** SINGLE LEADER: ~p, FAILED: ~p ***~n", [Leader2, FailedNodes2]),
+            io:format("~nCheck nodes: ~p~n", [L]),
+            heal_cluster(OnFail, Hosts, Names, Nodes, [Leader2], FailedNodes2);
+        {Leaders2, FailedNodes2} ->
+            io:format("*** MULTIPLE LEADERS: ~p, FAILED: ~p ***~n", [Leaders2, FailedNodes2]),
+            io:format("~nCheck nodes: ~p~n", [L]),
+            heal_cluster(OnFail, Hosts, Names, Nodes, Leaders2, FailedNodes2)
+        end
+    end.
+
+restart_leaders([], _Nodes) ->
+    io:format("*** NO NODES TO RESTART ***~n", []);
+restart_leaders(FailedNodes, Nodes) ->
+    [restart_leader(Node, Nodes) || Node <- FailedNodes].
+
+restart_leader(Node, Nodes) ->
+    %% In RE when timeout
+    stop_leader(Node),
+    timer:sleep(rand:uniform(5000)),
+    %% Supervisor's job
+    start_leader(Node, Nodes -- [Node]).
+
+%% connect_leaders([], _Nodes) ->
+%%     io:format("*** NO LEADERS TO CONNECT ***~n", []);
+%% connect_leaders(Leaders, Nodes) ->
+%%     [ping_nodes(Leader, Nodes) || Leader <- Leaders].
 
 start_master() ->
     case node() of
@@ -71,39 +223,20 @@ join(Host, Name, Nodes) ->
     start_leader(Node, Nodes),
     Node.
 
-leave(Node) ->
+leave_(Node) ->
     io:format("*** LEAVE ~p ***~n", [Node]),
     stop_worker(Node),
     stop_slave(Node).
 
-count_leaders(Nodes) ->
-    io:format("*** COUNT LEADERS ***~n", []),
-    L = [{Node, is_leader(Node)} || Node <- Nodes],
-    case catch lists:sum([count_leader(Res) || {_Node, Res} <- L]) of
-    0 ->
-        io:format("*** NO LEADER ***~n", []),
-        ok;
-    1 ->
-        io:format("*** SINGLE LEADER ***~n", []),
-        ok;
-    N when is_integer(N) ->
-        io:format("*** MULTIPLE (~p) LEADERS ***~n", [N]),
-        ok;
-    _ ->
-        io:format("~nCheck nodes: ~p~n", [L]),
-        {ok, DotFile, PngFile} = build_nodes_graph(L),
-        io:format("~nCheck graph: ~s ~s~n", [DotFile, PngFile]),
-        io:format("~p~n", [calendar:local_time()]),
-        io:fread("\nPress Enter to continue", ""),
-        error
-    end.
-
-count_leader(true) ->
-    1;
-count_leader(false) ->
-    0;
-count_leader(Other) ->
-    throw(Other).
+check_cluster(L) ->
+    lists:foldl(fun
+        ({Node, true}, {Leaders, Fails}) ->
+            {[Node | Leaders], Fails};
+        ({_Node, false}, Acc) ->
+            Acc;
+        ({Node, _Other}, {Leaders, Fails}) ->
+            {Leaders, [Node | Fails]}
+    end, {[], []}, L).
 
 start_slave(Host, Name, Args) ->
     {ok, Node} = slave:start(Host, Name, Args),
@@ -130,11 +263,14 @@ start_worker(Node) ->
 stop_worker(Node) ->
     rpc(Node, stop).
 
-%% ping(Node) ->
-%%     rpc(Node, ping).
+ping(Node) ->
+    rpc(Node, ping).
 
 start_leader(Node, Nodes) ->
     rpc(Node, {start_leader, Nodes}).
+
+stop_leader(Node) ->
+    rpc(Node, stop_leader).
 
 is_leader(Node) ->
     rpc(Node, is_leader).
@@ -174,7 +310,12 @@ build_nodes_graph(Nodes) ->
     PngFile = ["cluster-", Ts, ".png"],
     ok = file:write_file(DotFile, Dot),
     os:cmd(["dot", " -T png ", " -o ", PngFile, " ", DotFile]),
-    os:cmd(["xviewer", " ", PngFile]),
+    case os:getenv("IMAGE_VIEWER") of
+    ImageViewer when is_list(ImageViewer) ->
+        os:cmd([ImageViewer, " ", PngFile, "&"]);
+    _ ->
+        ok
+    end,
     {ok, DotFile, PngFile}.
 
 dot_node(Info) ->
@@ -210,7 +351,7 @@ rpc(Node, Req) ->
     receive
     {Ref, Rep} ->
         Rep
-    after 60000 ->
+    after 10000 ->
         timeout
     end.
 
@@ -239,16 +380,16 @@ worker(Parent) ->
                 {ok, Pid} = asg_manager:start_link(Nodes),
                 From ! {Ref, ok},
                 Loop(Pid);
+            {Ref, From, stop_leader} ->
+                catch exit(LeaderPid, restart), % might be nil
+                From ! {Ref, ok},
+                Loop(nil);
             {Ref, From, is_leader} ->
                 From ! {Ref, catch asg_manager:is_leader()},
                 Loop(LeaderPid);
             {Ref, From, known_nodes} ->
                 From ! {Ref, erlang:nodes()},
                 Loop(LeaderPid);
-            {'EXIT', LeaderPid, restart} ->
-                io:format("~p: leader restart~n", [node()]),
-                {ok, Pid} = asg_manager:start_link(),
-                Loop(Pid);
             Other ->
                 io:format("Unexpected: ~p~n", [Other]),
                 Loop(LeaderPid)
@@ -261,3 +402,6 @@ oneof(L) ->
 
 node_name(Node) ->
     lists:takewhile(fun ($@) -> false; (_) -> true end, atom_to_list(Node)).
+
+node_host(Node) ->
+    tl(lists:dropwhile(fun ($@) -> false; (_) -> true end, atom_to_list(Node))).
