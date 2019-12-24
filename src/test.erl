@@ -12,7 +12,7 @@
     join/1,
     leave/1,
     restart/1,
-    stats/0
+    info/0
 ]).
 %-compile(export_all).
 
@@ -61,14 +61,14 @@ continue() ->
 restart(Node) ->
     master_loop ! {restart, Node}.
 
-stats() ->
-    rpc_master(stats).
+info() ->
+    rpc_master(info).
 
-stats(#st{start = Start, fails = Fails}) ->
+info(#st{start = Start, fails = Fails, on_fail = OnFail}) ->
     Now = calendar:local_time(),
     Uptime = calendar:datetime_to_gregorian_seconds(Now) -
              calendar:datetime_to_gregorian_seconds(Start),
-    [{uptime, Uptime}, {fails, Fails}].
+    [{uptime, Uptime}, {fails, Fails}, {on_fail, OnFail}].
 
 inc_fails(St = #st{}, Fails) ->
     St#st{fails = St#st.fails + Fails}.
@@ -92,8 +92,8 @@ investigate(Hosts, Names, Nodes, St) ->
         {leave, Node} ->
             leave_(Node),
             investigate(Hosts, [node_name(Node) | Names], lists:delete(Node, Nodes), St);
-        {Ref, From, stats} ->
-            From ! {Ref, stats(St)},
+        {Ref, From, info} ->
+            From ! {Ref, info(St)},
             investigate(Hosts, Names, Nodes, St);
         continue ->
             loop(Hosts, Names, Nodes, St);
@@ -110,8 +110,8 @@ loop(Hosts, Names, Nodes, St) ->
             {ok, DotFile, PngFile} = build_nodes_graph(L),
             io:format("~nCheck graph: ~s ~s~n", [DotFile, PngFile]),
             loop(Hosts, Names, Nodes, St);
-        {Ref, From, stats} ->
-            From ! {Ref, stats(St)},
+        {Ref, From, info} ->
+            From ! {Ref, info(St)},
             loop(Hosts, Names, Nodes, St);
         pause ->
             investigate(Hosts, Names, Nodes, St);
@@ -150,7 +150,7 @@ loop(Hosts, Names, Nodes, St) ->
                 investigate ->
                     io:format("Connect to master@127.0.0.1 and run:~n"),
                     io:format("test:graph().~n"),
-                    io:format("test:stats().~n"),
+                    io:format("test:info().~n"),
                     io:format("test:restart(Node).~n"),
                     io:format("test:join(Node).~n"),
                     io:format("test:leave(Node).~n"),
@@ -178,8 +178,8 @@ heal_cluster(Hosts, Names, Nodes, Leaders, FailedNodes, St) ->
             {ok, DotFile, PngFile} = build_nodes_graph(L),
             io:format("~nCheck graph: ~s ~s~n", [DotFile, PngFile]),
             heal_cluster(Hosts, Names, Nodes, Leaders, FailedNodes, St);
-        {Ref, From, stats} ->
-            From ! {Ref, stats(St)},
+        {Ref, From, info} ->
+            From ! {Ref, info(St)},
             heal_cluster(Hosts, Names, Nodes, Leaders, FailedNodes, St);
         pause ->
             heal_cluster(Hosts, Names, Nodes, Leaders, FailedNodes, St);
