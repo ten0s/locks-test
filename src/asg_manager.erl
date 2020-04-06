@@ -35,7 +35,28 @@ stop() ->
     locks_leader:call(asg_manager, stop).
 
 is_leader() ->
-    locks_leader:call(asg_manager, is_leader).
+    T0 = erlang:system_time(millisecond),
+    Ns0 = nodes(),
+    try
+        locks_leader:call(asg_manager, is_leader, 60000)
+    catch
+        error:E ->
+            {error, E, #{t0 => T0,
+                         ns0 => Ns0,
+                         ns1 => ns1(Ns0)}, locks_window:fetch_log(asg_manager)};
+        exit:E ->
+            {error, E, #{t0 => T0,
+                         ns0 => Ns0,
+                         ns1 => ns1(Ns0)}, locks_window:fetch_log(asg_manager)}
+    end.
+
+ns1(Ns0) ->
+    case nodes() of
+        Ns0 ->
+            same;
+        Ns ->
+            Ns
+    end.
 
 %% cluster_nodes() ->
 %%     [list_to_atom(lists:concat(["n", "@", Host])) ||

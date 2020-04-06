@@ -79,7 +79,7 @@ leave(Node) ->
     stop_slave(Node).
 
 count_leaders(Nodes) ->
-    L = [{Node, is_leader(Node)} || Node <- Nodes],
+    L = pmap(fun(Node) -> {Node, is_leader(Node)} end, Nodes),
     case catch lists:sum([count_leader(Res) || {_Node, Res} <- L]) of
     0 ->
         io:format("*** NO LEADER ***~n", []),
@@ -95,6 +95,27 @@ count_leaders(Nodes) ->
         io:fread("\nPress Enter to continue", ""),
         error
     end.
+
+pmap(F, L) ->
+    Pids = [spawn_monitor(fun() ->
+                                  exit({ok, F(N)})
+                          end) || N <- L],
+    collect(Pids).
+
+collect([{Pid, MRef}|Pids]) ->
+    Res = receive
+              {'DOWN', MRef, process, Pid, Reason} ->
+                  case Reason of
+                      {ok, Good} ->
+                          Good;
+                      Bad ->
+                          {'EXIT', Bad}
+                  end
+          end,
+    [Res | collect(Pids)];
+collect([]) ->
+    [].
+
 
 count_leader(true) ->
     1;
@@ -147,8 +168,8 @@ rpc(Node, Req) ->
     receive
     {Ref, Rep} ->
         Rep
-    after 60000 ->
-        timeout
+    after 1200000 ->
+            timeout
     end.
 
 worker(Parent) ->
